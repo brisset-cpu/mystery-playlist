@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mystery Playlist</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script>
+const firebaseConfig = {
+  apiKey: "AIzaSyATySU-KiMhFs6nfBMWjRQQ5qavpURS92I",
+  authDomain: "mystery-playlist-2026.firebaseapp.com",
+  databaseURL: "https://mystery-playlist-2026-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "mystery-playlist-2026",
+  storageBucket: "mystery-playlist-2026.firebasestorage.app",
+  messagingSenderId: "149011787617",
+  appId: "1:149011787617:web:af9196d30e9a82b11c5f20"
+};
+
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+
+// ── STATE LOCAL ──
+let state = {
+  songs: [], participants: [], players: {}, votes: {0:{},1:{}},
+  settings: {gameOpen:false,revealOwners:false,votesOpen:[false,false],revealVotes:[false,false]},
+  adminLogged: false, currentPlayer: null
+};
+
+// ── FIREBASE LISTENERS ──
+function initFirebase() {
+  // Songs
+  db.ref('songs').on('value', snap => {
+    state.songs = snap.val() ? Object.values(snap.val()) : [];
+    refreshCurrentPage();
+  });
+  db.ref('participants').on('value', snap => {
+    state.participants = snap.val() ? snap.val() : [];
+    refreshCurrentPage();
+  });
+  db.ref('players').on('value', snap => {
+    state.players = snap.val() ? snap.val() : {};
+    refreshCurrentPage();
+  });
+  db.ref('votes').on('value', snap => {
+    const v = snap.val() || {0:{},1:{}};
+    state.votes = {0: v[0]||{}, 1: v[1]||{}};
+    refreshCurrentPage();
+  });
+  db.ref('settings').on('value', snap => {
+    if(snap.val()){
+      state.settings = snap.val();
+      if(!state.settings.votesOpen) state.settings.votesOpen=[false,false];
+      if(!state.settings.revealVotes) state.settings.revealVotes=[false,false];
+    }
+    // Hide loading, show content once settings are loaded
+    if(!settingsLoaded){
+      settingsLoaded = true;
+      document.getElementById('loadingMsg').style.display='none';
+    }
+    refreshCurrentPage();
+  });
+}
+
+function refreshCurrentPage(){
+  const active = document.querySelector('.page.active');
+  if(!active) return;
+  const id = active.id.replace('page-','');
+  if(id==='play') renderPlay();
+  if(id==='leaderboard') renderLeaderboard();
+  if(id==='votes') renderAllVotes();
+  if(id==='admin' && state.adminLogged) renderAdmin();
+}
+
+// ── FIREBASE WRITES ──
+async function fbSetSongs(songs){ await db.ref('songs').set(songs.length ? songs.reduce((o,s)=>{o[s.id]=s;return o;},{}) : null); }
+async function fbSetParticipants(p){ await db.ref('participants').set(p); }
+async function fbSetPlayer(name, data){ await db.ref('players/'+name.replace(/[.#$\[\]]/g,'_')).set(data); }
+async function fbSetSettings(s){ await db.ref('settings').set(s); }
+async function fbSetVote(voteId, playerName, target){ await db.ref('votes/'+voteId+'/'+playerName.replace(/[.#$\[\]]/g,'_')).set(target); }
+
+// ── NAV ──
+function showPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
+  const page=document.getElementById('page-'+id);
+  if(!page) return;
+  page.classList.add('active');
+  const tabs=['play','leaderboard','votes'];
+  const idx=tabs.indexOf(id);
+  if(idx>=0) document.querySelectorAll('.nav-tab')[idx].classList.add('active');
+  if(id==='play') renderPlay();
+  if(id==='leaderboard') renderLeaderboard();
+  if(id==='votes') renderAllVotes();
+  if(id==='admin'){
+    if(state.adminLogged){
+      document.getElementById('adminLogin').style.display='none';
+      document.getElementById('adminPanel').style.display='block';
+      renderAdmin();
+    } else {
+      document.getElementById('adminLogin').style.display='block';
+      document.getElementById('adminPanel').style.display='none';
+    }
+  }
+}
+
+// ── PLAY ──
+async function startPlaying(){
+  const name=document.getElementById('playerNameInput').value.trim();
+  if(!name){showToast('Saisis ton prenom !','error');return;}
+  state.currentPlayer=name;
+  localStorage.setItem('mp_player', name);
+  if(!state.players[name]) {
+    await fbSetPlayer(name, {guesses:{},score:0});
+  }
+  renderPlay();
+}
+
+function renderPlay(){
+  const setup=document.getElementById('playerSetup');
+  const closed=document.getElementById('gameClosedMsg');
+  const playing=document.getElementById('playingArea');
+  if(!state.currentPlayer){setup.style.display='block';closed.style.display='none';playing.style.display='none';return;}
+  if(!state.settings.gameOpen){setup.style.display='none';closed.style.display='block';playing.style.display='none';return;}
+  setup.style.display='none';closed.style.display='none';playing.style.display='block';
+  const pkey = state.currentPlayer.replace(/[.#$\[\]]/g,'_');
+  const player=state.players[pkey]||{guesses:{},score:0};
+  document.getElementById('guessedDisplay').textContent=Object.keys(player.guesses||{}).length;
+  document.getElementById('totalDisplay').textContent=state.songs.length;
+  document.getElementById('scoreDisplay').textContent=state.settings.revealOwners?(player.score||0):'-';
+  const list=document.getElementById('songsList');list.innerHTML='';
+  if(!state.songs.length){list.innerHTML='<p style="text-align:center;color:var(--muted);padding:40px">Aucune chanson pour l\'instant.</p>';return;}
+  state.songs.forEach((song,idx)=>{
+    const myGuess=(player.guesses||{})[song.id]||'';
+    const rev=state.settings.revealOwners;
+    const isCorrect=rev&&myGuess===song.owner;
+    const isWrong=rev&&myGuess&&myGuess!==song.owner;
+    const card=document.createElement('div');
+    card.className='song-card'+(myGuess?' answered':'')+(rev&&isCorrect?' revealed-correct':'')+(rev&&isWrong?' revealed-wrong':'');
+    const linkHtml=song.link?` <a href="${song.link}" target="_blank" style="color:var(--cyan);font-size:11px;text-decoration:none">Ecouter</a>`:'';
+    const avail=getAvailableNames(song.id, player);
+    const sorted=[...avail].sort((a,b)=>a.localeCompare(b,'fr'));
+    if(myGuess&&!sorted.includes(myGuess)) sorted.unshift(myGuess);
+    let opts='<option value="">— Choisir un prenom —</option>';
+    sorted.forEach(p=>{opts+=`<option value="${escHtml(p)}"${myGuess===p?' selected':''}>${escHtml(p)}</option>`;});
+    let resultHtml='';
+    if(rev){
+      if(isCorrect) resultHtml=`<div class="reveal-result correct"><div class="reveal-icon">🎉</div><div class="reveal-text"><strong>Bravo, c'etait ${escHtml(song.owner)} !</strong>+1 point</div></div>`;
+      else if(isWrong) resultHtml=`<div class="reveal-result wrong"><div class="reveal-icon">😅</div><div class="reveal-text"><strong>C'etait ${escHtml(song.owner)} !</strong>Tu avais dit : ${escHtml(myGuess)}</div></div>`;
+      else resultHtml=`<div class="reveal-result skip"><div class="reveal-icon">🤷</div><div class="reveal-text"><strong>C'etait ${escHtml(song.owner)}</strong>Tu n'as pas repondu.</div></div>`;
+    } else if(myGuess){
+      resultHtml=`<div class="waiting-banner">Reponse enregistree · Resultat a la revelation finale</div>`;
+    }
+    card.innerHTML=`
+      <div class="song-num">Chanson ${idx+1} / ${state.songs.length}</div>
+      <div class="song-title">${escHtml(song.title)}</div>
+      <div class="song-artist">${escHtml(song.artist)}${linkHtml}</div>
+      <div class="guess-label">A qui appartient cette chanson ?</div>
+      <div class="select-wrap"><select class="guess-select${myGuess?' has-value':''}" onchange="saveGuess('${song.id}',this.value)"${rev?' disabled':''}>${opts}</select></div>
+      ${resultHtml}`;
+    list.appendChild(card);
+  });
+}
+
+function getAvailableNames(currentSongId, player){
+  const used=new Set();
+  Object.entries(player.guesses||{}).forEach(([sid,name])=>{if(sid!==currentSongId) used.add(name);});
+  return state.participants.filter(p=>!used.has(p));
+}
+
+async function saveGuess(songId, value){
+  if(!state.currentPlayer||state.settings.revealOwners) return;
+  const pkey = state.currentPlayer.replace(/[.#$\[\]]/g,'_');
+  if(!state.players[pkey]) state.players[pkey]={guesses:{},score:0};
+  if(value) state.players[pkey].guesses[songId]=value;
+  else delete state.players[pkey].guesses[songId];
+  await fbSetPlayer(state.currentPlayer, state.players[pkey]);
+  if(value) showToast('Reponse enregistree','success');
+}
+
+// ── LEADERBOARD ──
+let lbTimer,lbCd=10;
+function renderLeaderboard(){
+  clearInterval(lbTimer);lbCd=10;updateLbCd();
+  lbTimer=setInterval(()=>{lbCd--;updateLbCd();if(lbCd<=0){lbCd=10;}},1000);
+  if(!state.settings.revealOwners){
+    document.getElementById('podiumArea').innerHTML='';
+    document.getElementById('leaderboardList').innerHTML='<div class="closed-msg"><div class="icon">⏳</div><h2>En attente</h2><p>Les scores s\'afficheront apres la revelation.</p></div>';
+    return;
+  }
+  const sorted=Object.entries(state.players).map(([key,p])=>{
+    let score=0,correct=0;
+    state.songs.forEach(s=>{if((p.guesses||{})[s.id]===s.owner){score++;correct++;}});
+    // find real name from participants
+    const name = state.participants.find(n=>n.replace(/[.#$\[\]]/g,'_')===key) || key;
+    return{name,score,correct};
+  }).sort((a,b)=>b.score-a.score||b.correct-a.correct);
+  if(!sorted.length){document.getElementById('podiumArea').innerHTML='';document.getElementById('leaderboardList').innerHTML='<p style="text-align:center;color:var(--muted);padding:40px">Aucun joueur</p>';return;}
+  const emojis=['🥇','🥈','🥉'],order=[1,0,2];
+  let pod='<div class="podium">';
+  order.forEach(i=>{
+    if(!sorted[i])return;
+    pod+=`<div><div class="podium-block p${i+1}"><div class="podium-rank">${i+1}</div><div class="podium-emoji">${emojis[i]}</div></div><div class="podium-name">${escHtml(sorted[i].name)}</div><div class="podium-score">${sorted[i].score} pt${sorted[i].score>1?'s':''}</div></div>`;
+  });
+  pod+='</div>';
+  document.getElementById('podiumArea').innerHTML=pod;
+  const listEl=document.getElementById('leaderboardList');listEl.innerHTML='';
+  sorted.forEach((p,i)=>{
+    const row=document.createElement('div');row.className='lb-row';
+    if(p.name===state.currentPlayer) row.style.borderColor='rgba(255,215,0,.3)';
+    row.innerHTML=`<div class="lb-pos">${i+1}</div><div class="lb-name">${escHtml(p.name)}${p.name===state.currentPlayer?' <span style="font-size:9px;color:var(--muted)">(moi)</span>':''}</div><div class="lb-good">✓ ${p.correct}/${state.songs.length}</div><div><span class="lb-pts">${p.score}</span> <span class="lb-unit">pts</span></div>`;
+    listEl.appendChild(row);
+  });
+}
+function updateLbCd(){const el=document.getElementById('lbCountdown');if(el)el.textContent=lbCd;}
+
+// ── VOTES ──
+const VOTE_CONFIG=[
+  {id:0,emoji:'🎤',label:"La casserole d'or",barClass:'bar-green',btnClass:'btn-green'},
+  {id:1,emoji:'🎶',label:'Le meilleur plaisir coupable',barClass:'bar-gold',btnClass:'btn-gold'}
+];
+let activeVoteTab=0;
+function switchVoteTab(idx){
+  activeVoteTab=idx;
+  document.querySelectorAll('.vote-tab-btn').forEach((b,i)=>b.classList.toggle('active',i===idx));
+  document.querySelectorAll('.vote-section').forEach((s,i)=>s.classList.toggle('active',i===idx));
+  renderVoteSection(VOTE_CONFIG[idx]);
+}
+function renderAllVotes(){VOTE_CONFIG.forEach(cfg=>renderVoteSection(cfg));}
+function renderVoteSection(cfg){
+  const open=state.settings.votesOpen[cfg.id];
+  const revealed=state.settings.revealVotes&&state.settings.revealVotes[cfg.id];
+  const closedEl=document.getElementById('vclosed-'+cfg.id);
+  const areaEl=document.getElementById('varea-'+cfg.id);
+  const winnerEl=document.getElementById('vwinner-'+cfg.id);
+  // Winner banner
+  if(revealed && winnerEl){
+    const counts={};
+    state.songs.forEach(s=>counts[s.id]=0);
+    Object.values(state.votes[cfg.id]).forEach(sid=>{if(counts[sid]!==undefined)counts[sid]++;});
+    const sorted=[...state.songs].sort((a,b)=>(counts[b.id]||0)-(counts[a.id]||0));
+    if(sorted.length && counts[sorted[0].id]>0){
+      const w=sorted[0];
+      const ownerLine=state.settings.revealOwners?'<div style="color:var(--pink);font-size:18px;margin-top:6px">👤 '+escHtml(w.owner)+'</div>':'';
+      winnerEl.style.display='block';
+      winnerEl.innerHTML='<div style="text-align:center;padding:28px 20px;border-radius:16px;background:linear-gradient(135deg,rgba(255,215,0,.12),rgba(255,77,141,.08));border:2px solid rgba(255,215,0,.35);margin-bottom:20px;animation:revealPop .5s ease both">'+
+        '<div style="font-size:52px;margin-bottom:8px">'+cfg.emoji+'</div>'+
+        '<div style="font-family:Bebas Neue;font-size:13px;letter-spacing:3px;color:var(--muted);margin-bottom:4px">GAGNANT</div>'+
+        '<div style="font-family:Bebas Neue;font-size:32px;letter-spacing:2px;background:linear-gradient(135deg,var(--gold),var(--pink));-webkit-background-clip:text;-webkit-text-fill-color:transparent">'+cfg.label+'</div>'+
+        '<div style="font-size:22px;font-weight:700;margin-top:12px">'+escHtml(w.title)+'</div>'+
+        '<div style="color:var(--muted);font-size:14px">'+escHtml(w.artist)+'</div>'+
+        ownerLine+
+        '<div style="color:var(--muted);font-size:12px;margin-top:8px">'+counts[w.id]+' vote'+(counts[w.id]>1?'s':'')+'</div>'+
+        '</div>';
+    }
+  } else if(winnerEl){ winnerEl.style.display='none'; }
+  if(!open && !revealed){closedEl.style.display='block';areaEl.innerHTML='';return;}
+  closedEl.style.display='none';
+  const pkey = state.currentPlayer ? state.currentPlayer.replace(/[.#$\[\]]/g,'_') : null;
+  const myVote=pkey?(state.votes[cfg.id][pkey]||null):null;
+  const counts={};
+  state.songs.forEach(s=>counts[s.id]=0);
+  Object.values(state.votes[cfg.id]).forEach(sid=>{if(counts[sid]!==undefined)counts[sid]++;});
+  const total=Object.values(counts).reduce((a,b)=>a+b,0);
+  const sorted=[...state.songs].sort((a,b)=>(counts[b.id]||0)-(counts[a.id]||0));
+  let html='';
+  if(revealed && !open) html+='<div style="text-align:center;padding:10px;border-radius:10px;background:rgba(255,215,0,.08);border:1px solid rgba(255,215,0,.2);color:var(--gold);font-size:12px;font-weight:600;margin-bottom:16px">🎉 Resultats finaux</div>';
+  sorted.forEach((song,i)=>{
+    const v=counts[song.id]||0,pct=total?Math.round(v/total*100):0,voted=myVote===song.id;
+    const ownerHtml=state.settings.revealOwners?' <span style="color:var(--pink);font-size:10px">· '+escHtml(song.owner)+'</span>':'';
+    const isWinner=i===0&&v>0&&revealed;
+    let voteBtn='';
+    if(open && state.currentPlayer){
+      voteBtn='<button class="btn-vote '+cfg.btnClass+' '+(voted?'voted':'')+'" '+(voted?'disabled':'')+' onclick="castVote('+cfg.id+',\''+song.id+'\')">'+(voted?'✓ Mon vote':cfg.emoji+' Voter')+'</button>';
+    } else if(open){
+      voteBtn='<p style="font-size:10px;color:var(--muted);margin-top:7px">Connecte-toi pour voter</p>';
+    }
+    html+='<div class="vote-card'+(isWinner?' revealed-correct':'')+'">'+
+      '<div style="font-size:10px;color:var(--muted);margin-bottom:3px">'+(isWinner?cfg.emoji+' GAGNANT':i===0&&v>0?cfg.emoji+' En tete':'#'+(i+1))+'</div>'+
+      '<div class="vote-song">'+escHtml(song.title)+ownerHtml+'</div>'+
+      '<div class="vote-artist">'+escHtml(song.artist)+'</div>'+
+      '<div class="vote-bar-bg"><div class="vote-bar-fill '+cfg.barClass+'" style="width:'+pct+'%"></div></div>'+
+      '<div class="vote-meta"><span>'+v+' vote'+(v>1?'s':'')+'</span><span>'+pct+'%</span></div>'+
+      voteBtn+'</div>';
+  });
+  areaEl.innerHTML=html||'<p style="text-align:center;color:var(--muted);padding:30px">Aucune chanson disponible.</p>';
+}
+
+async function castVote(voteId, target){
+  if(!state.currentPlayer){showToast("Connecte-toi d'abord !",'error');return;}
+  const pkey=state.currentPlayer.replace(/[.#$\[\]]/g,'_');
+  if(state.votes[voteId][pkey]){showToast('Tu as deja vote ici !','error');return;}
+  await fbSetVote(voteId, state.currentPlayer, target);
+  showToast('Vote enregistre ! '+VOTE_CONFIG[voteId].emoji,'success');
+}
+
+// ── ADMIN ──
+function doAdminLogin(){
+  const pwd=document.getElementById('adminPwdInput').value;
+  if(pwd==='admin2024'){
+    state.adminLogged=true;
+    document.getElementById('adminErr').style.display='none';
+    document.getElementById('adminLogin').style.display='none';
+    document.getElementById('adminPanel').style.display='block';
+    renderAdmin();
+  } else {
+    document.getElementById('adminErr').style.display='block';
+    document.getElementById('adminPwdInput').style.borderColor='var(--pink)';
+    setTimeout(()=>{document.getElementById('adminPwdInput').style.borderColor='';},1500);
+  }
+}
+
+function renderAdmin(){
+  if(!state.adminLogged) return;
+  document.getElementById('toggleGame').checked=state.settings.gameOpen;
+  document.getElementById('toggleReveal').checked=state.settings.revealOwners;
+  document.getElementById('toggleV0').checked=state.settings.votesOpen[0];
+  document.getElementById('toggleV1').checked=state.settings.votesOpen[1];
+  document.getElementById('toggleRV0').checked=state.settings.revealVotes[0];
+  document.getElementById('toggleRV1').checked=state.settings.revealVotes[1];
+  document.getElementById('participantCount').textContent=state.participants.length;
+  const pl=document.getElementById('participantsList');pl.innerHTML='';
+  [...state.participants].sort((a,b)=>a.localeCompare(b,'fr')).forEach(name=>{
+    const tag=document.createElement('div');tag.className='participant-tag';
+    tag.innerHTML=`${escHtml(name)} <button onclick="removeParticipant('${escHtml(name)}')" title="Suppr">x</button>`;
+    pl.appendChild(tag);
+  });
+  document.getElementById('adminSongCount').textContent=state.songs.length;
+  const sl=document.getElementById('adminSongList');sl.innerHTML='';
+  state.songs.forEach((song,i)=>{
+    const row=document.createElement('div');row.className='admin-song-row';
+    row.innerHTML=`<div class="admin-song-num">${i+1}</div><div class="admin-song-info"><div class="admin-song-title">${escHtml(song.title)} — ${escHtml(song.artist)}</div><div class="admin-song-owner">👤 ${escHtml(song.owner)}</div></div><button class="btn-del" onclick="deleteSong('${song.id}')">x</button>`;
+    sl.appendChild(row);
+  });
+  document.getElementById('statPlayers').textContent=Object.keys(state.players).length;
+  document.getElementById('statAnswered').textContent=Object.values(state.players).reduce((s,p)=>s+Object.keys(p.guesses||{}).length,0);
+  const tv=Object.values(state.votes).reduce((s,v)=>s+Object.keys(v).length,0);
+  document.getElementById('statVotes').textContent=tv;
+}
+
+async function updateSettings(){
+  const wasRev=state.settings.revealOwners;
+  const wasRV0=state.settings.revealVotes[0], wasRV1=state.settings.revealVotes[1];
+  state.settings.gameOpen=document.getElementById('toggleGame').checked;
+  state.settings.revealOwners=document.getElementById('toggleReveal').checked;
+  state.settings.votesOpen[0]=document.getElementById('toggleV0').checked;
+  state.settings.votesOpen[1]=document.getElementById('toggleV1').checked;
+  state.settings.revealVotes[0]=document.getElementById('toggleRV0').checked;
+  state.settings.revealVotes[1]=document.getElementById('toggleRV1').checked;
+  if(!wasRev && state.settings.revealOwners){
+    // Compute scores for all players
+    const updates={};
+    Object.entries(state.players).forEach(([key,p])=>{
+      let score=0;state.songs.forEach(s=>{if((p.guesses||{})[s.id]===s.owner)score++;});
+      updates[key]={...p,score};
+    });
+    for(const [key,data] of Object.entries(updates)){
+      await db.ref('players/'+key).set(data);
+    }
+    showToast('🎉 Revelation ! Scores calcules.','info');launchConfetti();
+  }
+  if((!wasRV0&&state.settings.revealVotes[0])||(!wasRV1&&state.settings.revealVotes[1])) launchConfetti();
+  await fbSetSettings(state.settings);
+  renderAdmin();
+  showToast('Parametres sauvegardes','success');
+}
+
+async function addParticipant(){
+  const val=document.getElementById('participantInput').value.trim();
+  if(!val)return;
+  if(state.participants.includes(val)){showToast('Deja dans la liste','error');return;}
+  state.participants.push(val);
+  document.getElementById('participantInput').value='';
+  await fbSetParticipants(state.participants);
+  showToast(val+' ajoute','success');
+}
+
+async function removeParticipant(name){
+  state.participants=state.participants.filter(p=>p!==name);
+  await fbSetParticipants(state.participants);
+}
+
+function toggleBulk(){const el=document.getElementById('bulkArea');el.style.display=el.style.display==='none'?'block':'none';}
+
+async function bulkImport(){
+  const names=document.getElementById('bulkInput').value.split(/[\n,;]+/).map(s=>s.trim()).filter(s=>s);
+  let added=0;names.forEach(n=>{if(!state.participants.includes(n)){state.participants.push(n);added++;}});
+  document.getElementById('bulkInput').value='';document.getElementById('bulkArea').style.display='none';
+  await fbSetParticipants(state.participants);
+  showToast(added+' prenom(s) importes','success');
+}
+
+async function addSong(){
+  const title=document.getElementById('addTitle').value.trim();
+  const artist=document.getElementById('addArtist').value.trim();
+  const owner=document.getElementById('addOwner').value.trim();
+  const link=document.getElementById('addLink').value.trim();
+  if(!title||!artist||!owner){showToast('Titre, artiste et proprietaire requis','error');return;}
+  if(!state.participants.includes(owner)){ state.participants.push(owner); await fbSetParticipants(state.participants); }
+  const song={id:Date.now().toString(36)+Math.random().toString(36).slice(2,6),title,artist,owner,link};
+  state.songs.push(song);
+  ['addTitle','addArtist','addOwner','addLink'].forEach(id=>document.getElementById(id).value='');
+  await fbSetSongs(state.songs);
+  showToast('Chanson ajoutee','success');
+}
+
+async function deleteSong(id){
+  if(!confirm('Supprimer ?'))return;
+  state.songs=state.songs.filter(s=>s.id!==id);
+  await fbSetSongs(state.songs);
+  showToast('Supprimee','info');
+}
+
+async function confirmReset(){
+  if(!confirm('Reset TOUT ?'))return;
+  if(!confirm('Derniere confirmation — irreversible.'))return;
+  await db.ref('songs').set(null);
+  await db.ref('participants').set(null);
+  await db.ref('players').set(null);
+  await db.ref('votes').set(null);
+  await fbSetSettings({gameOpen:false,revealOwners:false,votesOpen:[false,false],revealVotes:[false,false]});
+  showToast('Reset effectue','info');
+}
+
+// ── EXCEL ──
+var excelPending=[];
+function handleExcelDrop(e){const f=e.dataTransfer.files[0];if(f)processExcelFile(f);}
+function handleExcelFile(input){const f=input.files[0];if(f)processExcelFile(f);input.value='';}
+function processExcelFile(file){
+  if(!file.name.endsWith('.xlsx')){showToast('Fichier .xlsx requis','error');return;}
+  const reader=new FileReader();
+  reader.onload=function(e){
+    try{
+      const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'});
+      const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:''});
+      const parsed=[];
+      for(let i=1;i<rows.length;i++){
+        const r=rows[i];
+        const prenom=String(r[0]||'').trim(),chanson=String(r[1]||'').trim(),artiste=String(r[2]||'').trim(),lien=String(r[3]||'').trim();
+        if(prenom&&chanson&&artiste) parsed.push({prenom,chanson,artiste,lien});
+      }
+      if(!parsed.length){showToast('Aucune donnee valide','error');return;}
+      excelPending=parsed;
+      document.getElementById('excelPreviewMsg').textContent=parsed.length+' ligne(s) detectees :';
+      const pl=document.getElementById('excelPreviewList');pl.innerHTML='';
+      parsed.forEach(row=>{
+        const d=document.createElement('div');
+        d.style.cssText='padding:7px 11px;border-radius:7px;background:var(--bg3);border:1px solid var(--border);margin-bottom:5px;font-size:11px;';
+        d.innerHTML=`<strong style="color:var(--pink)">${escHtml(row.prenom)}</strong> → <strong>${escHtml(row.chanson)}</strong> — ${escHtml(row.artiste)}${row.lien?' 🔗':''}`;
+        pl.appendChild(d);
+      });
+      document.getElementById('excelPreview').style.display='block';
+      document.getElementById('dropZone').style.borderColor='var(--cyan)';
+    }catch(err){showToast('Erreur : '+err.message,'error');}
+  };
+  reader.readAsArrayBuffer(file);
+}
+async function confirmExcelImport(){
+  if(!excelPending.length)return;
+  excelPending.forEach(row=>{
+    if(!state.participants.includes(row.prenom)) state.participants.push(row.prenom);
+    state.songs.push({id:Date.now().toString(36)+Math.random().toString(36).slice(2,6),title:row.chanson,artist:row.artiste,owner:row.prenom,link:row.lien});
+  });
+  await fbSetParticipants(state.participants);
+  await fbSetSongs(state.songs);
+  excelPending=[];
+  document.getElementById('excelPreview').style.display='none';
+  document.getElementById('dropZone').style.borderColor='';
+  showToast('Import reussi !','success');
+}
+function cancelExcelImport(){excelPending=[];document.getElementById('excelPreview').style.display='none';document.getElementById('dropZone').style.borderColor='';}
+
+// ── CONFETTI ──
+function launchConfetti(){
+  const c=document.getElementById('confettiContainer');
+  const cols=['#FFD700','#FF4D8D','#00E5FF','#00E676','#B388FF'];
+  for(let i=0;i<70;i++){
+    const p=document.createElement('div');p.className='confetti-piece';
+    const col=cols[Math.floor(Math.random()*cols.length)];
+    p.style.cssText=`left:${Math.random()*100}%;background:${col};border-radius:${Math.random()>.5?'50%':'2px'};width:${6+Math.random()*7}px;height:${6+Math.random()*7}px;animation-duration:${1.4+Math.random()*1.6}s;animation-delay:${Math.random()*.5}s;`;
+    c.appendChild(p);setTimeout(()=>p.remove(),3200);
+  }
+}
+
+// ── TOAST ──
+let toastT;
+function showToast(msg,type='info'){
+  const t=document.getElementById('toast');clearTimeout(toastT);
+  t.textContent=msg;t.className='toast '+type;
+  setTimeout(()=>t.classList.add('show'),10);
+  toastT=setTimeout(()=>t.classList.remove('show'),2600);
+}
+
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+// ── INIT ──
+// Show loading until Firebase settings are loaded
+let settingsLoaded = false;
+document.getElementById('playerSetup').style.display='none';
+document.getElementById('gameClosedMsg').style.display='none';
+document.getElementById('playingArea').style.display='none';
+document.getElementById('loadingMsg').style.display='block';
+
+const savedPlayer = localStorage.getItem('mp_player');
+if(savedPlayer){ state.currentPlayer=savedPlayer; document.getElementById('playerNameInput').value=savedPlayer; }
+initFirebase();
+
+</script>
+<style>
+:root{--gold:#FFD700;--pink:#FF4D8D;--cyan:#00E5FF;--green:#00E676;
+  --bg:#0A0A0F;--bg2:#12121A;--bg3:#1A1A26;--card:#1E1E2E;--border:rgba(255,255,255,0.08);--text:#F0F0F8;--muted:#888;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;display:flex;align-items:center;justify-content:space-between;
+  padding:0 16px;height:56px;background:rgba(10,10,15,.95);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);}
+.nav-logo{font-family:'Bebas Neue';font-size:18px;letter-spacing:2px;
+  background:linear-gradient(90deg,var(--gold),var(--pink));-webkit-background-clip:text;-webkit-text-fill-color:transparent;white-space:nowrap;}
+.nav-tabs{display:flex;gap:2px;overflow-x:auto;}.nav-tabs::-webkit-scrollbar{display:none;}
+.nav-tab{padding:5px 11px;border-radius:18px;border:none;background:transparent;color:var(--muted);
+  font-family:'DM Sans';font-size:12px;font-weight:500;cursor:pointer;transition:all .2s;white-space:nowrap;}
+.nav-tab:hover{color:var(--text);}
+.nav-tab.active{background:var(--bg3);color:var(--gold);border:1px solid rgba(255,215,0,.2);}
+.btn-admin{padding:5px 12px;border-radius:18px;background:transparent;border:1px solid var(--border);
+  color:var(--muted);font-family:'DM Sans';font-size:12px;cursor:pointer;transition:all .2s;}
+.btn-admin:hover{border-color:var(--pink);color:var(--pink);}
+.page{display:none;padding-top:72px;min-height:100vh;padding-bottom:60px;}
+.page.active{display:block;}
+.container{max-width:680px;margin:0 auto;padding:0 16px;}
+.page-header{text-align:center;padding:28px 16px 20px;}
+.page-header h1{font-family:'Bebas Neue';font-size:clamp(40px,8vw,72px);letter-spacing:4px;line-height:1;
+  background:linear-gradient(135deg,var(--gold) 0%,var(--pink) 50%,var(--cyan) 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.page-header p{color:var(--muted);margin-top:8px;font-size:13px;}
+.setup-box{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:32px;text-align:center;max-width:420px;margin:48px auto;}
+.setup-box h2{font-family:'Bebas Neue';font-size:32px;letter-spacing:2px;margin-bottom:8px;}
+.setup-box p{color:var(--muted);margin-bottom:22px;font-size:13px;line-height:1.6;}
+.input-field{width:100%;padding:12px 15px;border-radius:10px;background:var(--bg3);border:1px solid var(--border);
+  color:var(--text);font-family:'DM Sans';font-size:14px;margin-bottom:12px;transition:border-color .2s;}
+.input-field:focus{outline:none;border-color:var(--gold);}
+.btn-primary{width:100%;padding:12px;border-radius:10px;background:linear-gradient(135deg,var(--gold),var(--pink));
+  border:none;color:#000;font-family:'DM Sans';font-size:14px;font-weight:700;cursor:pointer;transition:opacity .2s;}
+.btn-primary:hover{opacity:.88;}
+.score-widget{position:sticky;top:64px;z-index:50;display:flex;justify-content:center;margin-bottom:18px;}
+.score-pill{display:flex;gap:16px;align-items:center;padding:8px 22px;border-radius:40px;background:var(--card);border:1px solid var(--border);}
+.score-item{text-align:center;}
+.score-val{font-family:'Bebas Neue';font-size:22px;letter-spacing:2px;color:var(--gold);line-height:1;}
+.score-lbl{font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;}
+.score-div{width:1px;height:26px;background:var(--border);}
+.song-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:12px;transition:border-color .3s;}
+.song-card.answered{border-color:rgba(0,229,255,.2);}
+.song-card.revealed-correct{border-color:rgba(0,229,255,.5);background:rgba(0,229,255,.04);}
+.song-card.revealed-wrong{border-color:rgba(255,77,141,.4);background:rgba(255,77,141,.03);}
+.song-num{font-family:'Bebas Neue';font-size:11px;letter-spacing:3px;color:var(--muted);margin-bottom:5px;}
+.song-title{font-family:'Bebas Neue';font-size:26px;letter-spacing:1px;line-height:1.1;margin-bottom:3px;}
+.song-artist{color:var(--muted);font-size:13px;margin-bottom:16px;}
+.guess-label{font-size:11px;color:var(--muted);letter-spacing:.5px;margin-bottom:7px;}
+.select-wrap{position:relative;}
+.select-wrap::after{content:'\25BE';position:absolute;right:13px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none;}
+.guess-select{width:100%;padding:12px 38px 12px 14px;border-radius:10px;background:var(--bg3);border:1px solid var(--border);
+  color:var(--text);font-family:'DM Sans';font-size:14px;font-weight:500;cursor:pointer;appearance:none;-webkit-appearance:none;transition:border-color .2s;}
+.guess-select:focus{outline:none;border-color:var(--cyan);}
+.guess-select:disabled{opacity:.55;cursor:default;}
+.guess-select.has-value{border-color:rgba(0,229,255,.3);}
+.reveal-result{margin-top:12px;padding:13px 15px;border-radius:10px;display:flex;align-items:center;gap:11px;animation:revealPop .35s ease both;}
+.reveal-result.correct{background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.25);}
+.reveal-result.wrong{background:rgba(255,77,141,.08);border:1px solid rgba(255,77,141,.2);}
+.reveal-result.skip{background:rgba(136,136,136,.05);border:1px solid rgba(136,136,136,.15);}
+.reveal-icon{font-size:24px;}.reveal-text{font-size:13px;line-height:1.4;}.reveal-text strong{display:block;font-size:14px;}
+@keyframes revealPop{0%{transform:scale(.9);opacity:0}100%{transform:scale(1);opacity:1}}
+.waiting-banner{text-align:center;padding:12px;border-radius:10px;margin-top:10px;
+  background:rgba(255,215,0,.06);border:1px solid rgba(255,215,0,.15);color:var(--gold);font-size:12px;font-weight:500;}
+.closed-msg{text-align:center;padding:56px 20px;}
+.closed-msg .icon{font-size:56px;margin-bottom:12px;}
+.closed-msg h2{font-family:'Bebas Neue';font-size:30px;letter-spacing:2px;margin-bottom:8px;}
+.closed-msg p{color:var(--muted);font-size:13px;}
+.podium{display:flex;align-items:flex-end;justify-content:center;gap:10px;padding:14px 0 24px;}
+.podium-block{border-radius:12px 12px 0 0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding-bottom:10px;width:100px;position:relative;}
+.podium-rank{font-family:'Bebas Neue';font-size:36px;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);opacity:.12;}
+.p1{height:130px;background:linear-gradient(180deg,rgba(255,215,0,.28),rgba(255,215,0,.08));border:1px solid rgba(255,215,0,.35);}
+.p2{height:95px;background:linear-gradient(180deg,rgba(192,192,192,.18),rgba(192,192,192,.04));border:1px solid rgba(192,192,192,.25);}
+.p3{height:68px;background:linear-gradient(180deg,rgba(205,127,50,.18),rgba(205,127,50,.04));border:1px solid rgba(205,127,50,.25);}
+.podium-emoji{font-size:20px;margin-bottom:4px;position:relative;z-index:1;}
+.podium-name{font-weight:600;font-size:11px;margin-top:5px;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;}
+.podium-score{font-size:10px;color:var(--muted);margin-top:2px;text-align:center;}
+.lb-row{display:flex;align-items:center;gap:12px;padding:11px 16px;border-radius:10px;background:var(--card);border:1px solid var(--border);margin-bottom:6px;}
+.lb-pos{font-family:'Bebas Neue';font-size:17px;color:var(--muted);width:22px;text-align:center;}
+.lb-name{flex:1;font-weight:500;font-size:13px;}.lb-good{font-size:11px;color:var(--cyan);margin-right:5px;}
+.lb-pts{font-family:'Bebas Neue';font-size:19px;color:var(--gold);}.lb-unit{font-size:10px;color:var(--muted);}
+.votes-tabs{display:flex;gap:6px;margin-bottom:20px;}
+.vote-tab-btn{padding:8px 16px;border-radius:20px;border:1px solid var(--border);background:var(--bg3);color:var(--muted);font-family:'DM Sans';font-size:13px;font-weight:500;cursor:pointer;transition:all .2s;white-space:nowrap;}
+.vote-tab-btn.active{color:var(--text);border-color:rgba(255,255,255,.2);background:var(--card);}
+.vote-tab-btn.active.vgreen{border-color:rgba(0,230,118,.4);color:var(--green);}
+.vote-tab-btn.active.vgold{border-color:rgba(255,215,0,.4);color:var(--gold);}
+.vote-section{display:none;}.vote-section.active{display:block;}
+.vote-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;margin-bottom:10px;}
+.vote-card.revealed-correct{border-color:rgba(255,215,0,.5);background:rgba(255,215,0,.04);}
+.vote-song{font-weight:600;font-size:14px;margin-bottom:2px;}.vote-artist{color:var(--muted);font-size:12px;margin-bottom:11px;}
+.vote-bar-bg{height:6px;border-radius:3px;background:var(--bg3);overflow:hidden;margin-bottom:5px;}
+.vote-bar-fill{height:100%;border-radius:3px;transition:width .6s cubic-bezier(.4,0,.2,1);}
+.bar-green{background:linear-gradient(90deg,var(--green),var(--cyan));}
+.bar-gold{background:linear-gradient(90deg,var(--gold),var(--pink));}
+.vote-meta{display:flex;justify-content:space-between;font-size:10px;color:var(--muted);}
+.btn-vote{padding:7px 16px;border-radius:16px;font-family:'DM Sans';font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;margin-top:8px;border:1px solid;}
+.btn-green{background:rgba(0,230,118,.1);border-color:rgba(0,230,118,.3);color:var(--green);}
+.btn-green:hover{background:rgba(0,230,118,.2);}.btn-green.voted{background:rgba(0,230,118,.22);border-color:var(--green);}
+.btn-gold{background:rgba(255,215,0,.1);border-color:rgba(255,215,0,.3);color:var(--gold);}
+.btn-gold:hover{background:rgba(255,215,0,.2);}.btn-gold.voted{background:rgba(255,215,0,.22);border-color:var(--gold);}
+.btn-vote:disabled{opacity:.5;cursor:default;}
+.admin-login{max-width:360px;margin:60px auto;background:var(--card);border:1px solid var(--border);border-radius:20px;padding:32px;text-align:center;}
+.admin-login h2{font-family:'Bebas Neue';font-size:28px;letter-spacing:2px;margin-bottom:6px;}
+.admin-login p{color:var(--muted);margin-bottom:20px;font-size:13px;}
+.admin-section{margin-bottom:24px;}
+.admin-section h3{font-family:'Bebas Neue';font-size:19px;letter-spacing:2px;margin-bottom:11px;border-bottom:1px solid var(--border);padding-bottom:6px;}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-bottom:9px;}
+.form-group{display:flex;flex-direction:column;gap:4px;}
+.form-label{font-size:11px;color:var(--muted);letter-spacing:.5px;}
+.btn-add{padding:10px 20px;border-radius:9px;background:rgba(0,229,255,.1);border:1px solid rgba(0,229,255,.25);color:var(--cyan);font-family:'DM Sans';font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;}
+.btn-add:hover{background:rgba(0,229,255,.18);}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:12px 15px;border-radius:10px;background:var(--bg3);border:1px solid var(--border);margin-bottom:7px;}
+.toggle-label{font-weight:500;font-size:13px;}.toggle-desc{font-size:11px;color:var(--muted);margin-top:2px;}
+.toggle-switch{position:relative;width:42px;height:23px;cursor:pointer;flex-shrink:0;}
+.toggle-switch input{opacity:0;width:0;height:0;}
+.toggle-track{position:absolute;inset:0;border-radius:11px;background:var(--bg2);border:1px solid var(--border);transition:all .3s;}
+.toggle-thumb{position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:50%;background:var(--muted);transition:all .3s;}
+.toggle-switch input:checked ~ .toggle-track{background:rgba(0,229,255,.18);border-color:var(--cyan);}
+.toggle-switch input:checked ~ .toggle-thumb{left:22px;background:var(--cyan);}
+.btn-row{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px;}
+.btn-danger{padding:8px 16px;border-radius:9px;background:rgba(255,77,141,.1);border:1px solid rgba(255,77,141,.3);color:var(--pink);font-family:'DM Sans';font-size:13px;font-weight:600;cursor:pointer;}
+.btn-danger:hover{background:rgba(255,77,141,.2);}
+.admin-song-list{max-height:280px;overflow-y:auto;}
+.admin-song-row{display:flex;align-items:center;gap:9px;padding:8px 11px;border-radius:8px;background:var(--bg3);border:1px solid var(--border);margin-bottom:5px;}
+.admin-song-num{font-family:'Bebas Neue';font-size:14px;color:var(--muted);width:17px;}
+.admin-song-info{flex:1;font-size:12px;}.admin-song-title{font-weight:600;}.admin-song-owner{color:var(--pink);font-size:11px;margin-top:1px;}
+.btn-del{padding:3px 8px;border-radius:5px;background:rgba(255,77,141,.1);border:1px solid rgba(255,77,141,.2);color:var(--pink);font-size:11px;cursor:pointer;}
+.participants-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px;}
+.participant-tag{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;border-radius:18px;background:var(--bg3);border:1px solid var(--border);font-size:12px;}
+.participant-tag button{background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;line-height:1;padding:0;}
+.participant-tag button:hover{color:var(--pink);}
+.add-row{display:flex;gap:7px;margin-top:7px;}
+.add-row input{flex:1;margin-bottom:0;}
+.btn-sm{padding:0 16px;border-radius:10px;height:44px;background:rgba(0,229,255,.1);border:1px solid rgba(0,229,255,.25);color:var(--cyan);font-family:'DM Sans';font-size:13px;font-weight:600;cursor:pointer;}
+.stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:11px;padding:14px;text-align:center;}
+.stat-val{font-family:'Bebas Neue';font-size:30px;line-height:1;}.stat-lbl{font-size:10px;color:var(--muted);margin-top:2px;}
+.drop-zone{border:2px dashed var(--border);border-radius:11px;padding:22px;text-align:center;cursor:pointer;transition:border-color .2s;}
+.drop-zone:hover{border-color:var(--cyan);}
+.confetti-container{position:fixed;inset:0;pointer-events:none;z-index:999;overflow:hidden;}
+.confetti-piece{position:absolute;animation:confettiFall linear forwards;}
+@keyframes confettiFall{0%{transform:translateY(-20px) rotate(0deg);opacity:1}100%{transform:translateY(110vh) rotate(720deg);opacity:0}}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(70px);padding:10px 20px;border-radius:10px;
+  background:var(--card);border:1px solid var(--border);font-size:13px;font-weight:500;transition:transform .3s cubic-bezier(.34,1.56,.64,1);z-index:1000;white-space:nowrap;}
+.toast.show{transform:translateX(-50%) translateY(0);}
+.toast.success{border-color:var(--cyan);color:var(--cyan);}.toast.error{border-color:var(--pink);color:var(--pink);}.toast.info{border-color:var(--gold);color:var(--gold);}
+::-webkit-scrollbar{width:4px;}::-webkit-scrollbar-track{background:var(--bg2);}::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
+@media(max-width:480px){.form-row{grid-template-columns:1fr;}.stats-grid{grid-template-columns:1fr 1fr;}}
+</style>
+</head>
+<body>
+<nav>
+  <div class="nav-logo">🎵 Mystery Playlist</div>
+  <div class="nav-tabs">
+    <button class="nav-tab active" onclick="showPage('play')">Jouer</button>
+    <button class="nav-tab" onclick="showPage('leaderboard')">Classement</button>
+    <button class="nav-tab" onclick="showPage('votes')">Votes</button>
+  </div>
+  <button class="btn-admin" onclick="showPage('admin')">Admin</button>
+</nav>
+<div class="confetti-container" id="confettiContainer"></div>
+<div class="toast" id="toast"></div>
+
+<!-- JOUER -->
+<div class="page active" id="page-play">
+  <div class="container">
+    <div id="loadingMsg" style="text-align:center;padding:80px 20px;display:none">
+      <div style="font-size:48px;margin-bottom:16px">🎵</div>
+      <div style="font-family:'Bebas Neue';font-size:24px;letter-spacing:3px;color:var(--muted)">Chargement...</div>
+    </div>
+    <div id="playerSetup" class="setup-box">
+      <div style="font-size:44px;margin-bottom:12px">🎵</div>
+      <h2>Mystery Playlist</h2>
+      <p>Retrouve a qui appartient chaque chanson !<br>Les resultats seront reveles tous ensemble a la fin.</p>
+      <input class="input-field" id="playerNameInput" type="text" placeholder="Ton prenom..." maxlength="30">
+      <button class="btn-primary" onclick="startPlaying()">C'est parti !</button>
+    </div>
+    <div id="gameClosedMsg" class="closed-msg" style="display:none">
+      <div class="icon">🔒</div><h2>Jeu en pause</h2><p>L'admin n'a pas encore ouvert le jeu.</p>
+    </div>
+    <div id="playingArea" style="display:none">
+      <div class="score-widget">
+        <div class="score-pill">
+          <div class="score-item"><div class="score-val" id="guessedDisplay">0</div><div class="score-lbl">Repondues</div></div>
+          <div class="score-div"></div>
+          <div class="score-item"><div class="score-val" id="totalDisplay">0</div><div class="score-lbl">Total</div></div>
+          <div class="score-div"></div>
+          <div class="score-item"><div class="score-val" id="scoreDisplay">-</div><div class="score-lbl">Score</div></div>
+        </div>
+      </div>
+      <div id="songsList"></div>
+    </div>
+  </div>
+</div>
+
+<!-- CLASSEMENT -->
+<div class="page" id="page-leaderboard">
+  <div class="container">
+    <div class="page-header"><h1>Classement</h1><p>Mis a jour en temps reel · <span id="lbCountdown">10</span>s</p></div>
+    <div id="podiumArea"></div>
+    <div id="leaderboardList"></div>
+  </div>
+</div>
+
+<!-- VOTES -->
+<div class="page" id="page-votes">
+  <div class="container">
+    <div class="page-header"><h1>Votes</h1><p>Deux categories, un vote chacune</p></div>
+    <div class="votes-tabs">
+      <button class="vote-tab-btn active vgreen" onclick="switchVoteTab(0)">🎤 La Casserole d'Or</button>
+      <button class="vote-tab-btn vgold" onclick="switchVoteTab(1)">🎶 Meilleur Plaisir Coupable</button>
+    </div>
+    <div class="vote-section active" id="vsection-0">
+      <div id="vwinner-0" style="display:none"></div>
+      <div id="vclosed-0" class="closed-msg" style="display:none"><div class="icon">🗳️</div><h2>Vote ferme</h2><p>L'admin n'a pas ouvert ce vote.</p></div>
+      <div id="varea-0"></div>
+    </div>
+    <div class="vote-section" id="vsection-1">
+      <div id="vwinner-1" style="display:none"></div>
+      <div id="vclosed-1" class="closed-msg" style="display:none"><div class="icon">🗳️</div><h2>Vote ferme</h2><p>L'admin n'a pas ouvert ce vote.</p></div>
+      <div id="varea-1"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ADMIN -->
+<div class="page" id="page-admin">
+  <div class="container">
+    <div id="adminLogin" class="admin-login">
+      <div style="font-size:36px;margin-bottom:10px">🔐</div>
+      <h2>Administration</h2><p>Reserve a l'organisateur</p>
+      <input class="input-field" id="adminPwdInput" type="password" placeholder="Mot de passe..." onkeydown="if(event.key==='Enter')doAdminLogin()">
+      <button class="btn-primary" onclick="doAdminLogin()">Entrer</button>
+      <p id="adminErr" style="color:var(--pink);font-size:12px;margin-top:10px;display:none">Mot de passe incorrect</p>
+    </div>
+    <div id="adminPanel" style="display:none">
+      <div class="page-header"><h1>Admin</h1></div>
+
+      <div class="admin-section">
+        <h3>Import Excel</h3>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:11px">Colonnes : <strong style="color:var(--cyan)">Prenom | Chanson | Artiste | Lien</strong></p>
+        <div class="drop-zone" id="dropZone" onclick="document.getElementById('excelFile').click()"
+          ondragover="event.preventDefault();this.style.borderColor='var(--cyan)'"
+          ondragleave="this.style.borderColor=''"
+          ondrop="event.preventDefault();this.style.borderColor='';handleExcelDrop(event)">
+          <div style="font-size:28px;margin-bottom:7px">📊</div>
+          <div style="font-weight:600;font-size:13px;margin-bottom:3px">Glisse ton fichier Excel ici</div>
+          <div style="font-size:11px;color:var(--muted)">ou clique pour choisir un .xlsx</div>
+          <input type="file" id="excelFile" accept=".xlsx" style="display:none" onchange="handleExcelFile(this)">
+        </div>
+        <div id="excelPreview" style="display:none;margin-top:12px">
+          <div style="font-size:12px;color:var(--cyan);margin-bottom:9px" id="excelPreviewMsg"></div>
+          <div style="max-height:180px;overflow-y:auto;margin-bottom:11px" id="excelPreviewList"></div>
+          <div style="display:flex;gap:9px">
+            <button class="btn-add" onclick="confirmExcelImport()">Confirmer</button>
+            <button class="btn-danger" onclick="cancelExcelImport()">Annuler</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="admin-section">
+        <h3>Participants (<span id="participantCount">0</span>)</h3>
+        <div class="add-row">
+          <input class="input-field" id="participantInput" placeholder="Ajouter un prenom..." onkeydown="if(event.key==='Enter')addParticipant()">
+          <button class="btn-sm" onclick="addParticipant()">+ Ajouter</button>
+        </div>
+        <div style="margin-top:9px">
+          <button class="btn-add" onclick="toggleBulk()" style="font-size:11px;padding:7px 14px">Import texte</button>
+        </div>
+        <div id="bulkArea" style="display:none;margin-top:9px">
+          <textarea class="input-field" id="bulkInput" rows="4" placeholder="Un prenom par ligne ou separes par virgules..." style="resize:vertical"></textarea>
+          <button class="btn-add" onclick="bulkImport()">Importer</button>
+        </div>
+        <div class="participants-list" id="participantsList"></div>
+      </div>
+
+      <div class="admin-section">
+        <h3>Controles</h3>
+        <div class="toggle-row">
+          <div><div class="toggle-label">Jeu ouvert</div><div class="toggle-desc">Les participants peuvent jouer</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="toggleGame" onchange="updateSettings()"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+        <div class="toggle-row">
+          <div><div class="toggle-label">🎉 Revelation collective</div><div class="toggle-desc">Devoile les proprietaires + calcule les scores</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="toggleReveal" onchange="updateSettings()"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+        <p style="font-size:11px;color:var(--muted);margin:14px 0 8px;letter-spacing:.5px;text-transform:uppercase">Votes</p>
+        <div class="toggle-row">
+          <div><div class="toggle-label">🎤 Ouvrir vote Casserole d'Or</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="toggleV0" onchange="updateSettings()"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+        <div class="toggle-row">
+          <div><div class="toggle-label">🏆 Annoncer gagnant Casserole</div><div class="toggle-desc">Affiche le gagnant sur tous les ecrans</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="toggleRV0" onchange="updateSettings()"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+        <div class="toggle-row">
+          <div><div class="toggle-label">🎶 Ouvrir vote Plaisir Coupable</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="toggleV1" onchange="updateSettings()"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+        <div class="toggle-row">
+          <div><div class="toggle-label">🏆 Annoncer gagnant Plaisir Coupable</div><div class="toggle-desc">Affiche le gagnant sur tous les ecrans</div></div>
+          <label class="toggle-switch"><input type="checkbox" id="toggleRV1" onchange="updateSettings()"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+        <div class="btn-row">
+          <button class="btn-danger" onclick="confirmReset()">Reset complet</button>
+        </div>
+      </div>
+
+      <div class="admin-section">
+        <h3>Ajouter une chanson</h3>
+        <div class="form-row">
+          <div class="form-group"><div class="form-label">Titre *</div><input class="input-field" id="addTitle" placeholder="La Bamba" style="margin-bottom:0"></div>
+          <div class="form-group"><div class="form-label">Artiste *</div><input class="input-field" id="addArtist" placeholder="Ritchie Valens" style="margin-bottom:0"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><div class="form-label">Proprietaire secret *</div><input class="input-field" id="addOwner" placeholder="Prenom reel" style="margin-bottom:0"></div>
+          <div class="form-group"><div class="form-label">Lien Spotify/YouTube</div><input class="input-field" id="addLink" placeholder="https://..." style="margin-bottom:0"></div>
+        </div>
+        <button class="btn-add" onclick="addSong()">+ Ajouter</button>
+      </div>
+
+      <div class="admin-section">
+        <h3>Chansons (<span id="adminSongCount">0</span>)</h3>
+        <div class="admin-song-list" id="adminSongList"></div>
+      </div>
+
+      <div class="admin-section">
+        <h3>Stats</h3>
+        <div class="stats-grid">
+          <div class="stat-card"><div class="stat-val" id="statPlayers" style="color:var(--gold)">0</div><div class="stat-lbl">Joueurs</div></div>
+          <div class="stat-card"><div class="stat-val" id="statAnswered" style="color:var(--cyan)">0</div><div class="stat-lbl">Reponses</div></div>
+          <div class="stat-card"><div class="stat-val" id="statVotes" style="color:var(--pink)">0</div><div class="stat-lbl">Votes</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
